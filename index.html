@@ -19,6 +19,7 @@
             align-items: center;
             min-height: 100vh;
             margin: 0;
+            padding: 20px;
         }
 
         .quiz-container {
@@ -61,10 +62,16 @@
             border-radius: 8px;
             font-size: clamp(1.2em, 3vw, 1.7em);
             cursor: pointer;
-            transition: border 0.3s, box-shadow 0.3s;
+            transition: transform 0.1s, box-shadow 0.1s;
             box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
             user-select: none;
             font-weight: 700;
+        }
+        
+        /* Animation/Feedback bei Klick */
+        .option:active {
+            transform: scale(0.98);
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
         }
 
         /* Farben für die Optionen im Kahoot-Stil */
@@ -86,6 +93,26 @@
             font-size: 1.2em;
             color: #777;
             font-weight: 700;
+        }
+
+        /* Button Stil */
+        #next-button {
+            margin-top: 20px;
+            padding: 15px 30px;
+            font-size: 1.5em;
+            font-weight: 900;
+            background-color: #38a169; /* Dunkelgrün */
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            box-shadow: 0 6px #106f39;
+            transition: background-color 0.1s, transform 0.1s;
+        }
+
+        #next-button:active {
+            transform: translateY(2px);
+            box-shadow: 0 4px #106f39;
         }
 
         /* Loading Spinner */
@@ -116,7 +143,11 @@
             <!-- Antworten werden von JS eingefügt -->
         </div>
         
-        <p class="hint">Drücke die **Leertaste** (Space), um die **Lösung** anzuzeigen!</p>
+        <p class="hint" id="hint-text">Drücke die **Leertaste** (Space), um die **Lösung** anzuzeigen!</p>
+        
+        <button id="next-button" class="hidden">
+            <i class="fas fa-chevron-right"></i> Nächste Frage
+        </button>
     </div>
 
     <script type="module">
@@ -132,14 +163,13 @@
         // Globals vom Canvas Environment (wird für Firestore Pfade benötigt)
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-quiz-app';
         
-        // Robusteres Parsen der Firebase-Konfiguration, um "Parse error" zu vermeiden
+        // Robusteres Parsen der Firebase-Konfiguration
         let initialFirebaseConfig = {};
         if (typeof __firebase_config !== 'undefined' && __firebase_config.length > 0) {
             try {
                 initialFirebaseConfig = JSON.parse(__firebase_config);
             } catch (e) {
                 console.error("Fehler beim Parsen der __firebase_config:", e);
-                // Bleibt bei {}
             }
         }
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
@@ -167,77 +197,98 @@
         const questionElement = document.getElementById('question-text');
         const optionsGrid = document.getElementById('options-grid');
         const loader = document.getElementById('loader');
+        const nextButton = document.getElementById('next-button');
+        const hintText = document.getElementById('hint-text');
+
 
         let currentQuizData = null; // Speichert die aktuelle Frage
+        let allQuestions = [];      // Speichert alle Fragen aus Firestore
+        let solutionShown = false;  // Flag, um zu wissen, ob die Lösung angezeigt wurde
 
         // =================================================================
         // 2. FIREBASE LOGIK
         // =================================================================
 
         /**
-         * Meldet den Nutzer anonym an, um Firestore-Zugriff zu erhalten.
+         * Meldet den Nutzer anonym an und ruft alle Fragen ab.
          */
         async function authenticateAndStart() {
             try {
-                // Anonyme Anmeldung wird verwendet, da der Token im anonymen Kontext
-                // möglicherweise nicht benötigt wird und um den Code einfach zu halten.
+                // Führt die anonyme Anmeldung durch (benötigt für Firestore-Regeln)
                 await signInAnonymously(auth);
-                
-                // Sobald angemeldet, Fragen abrufen
-                fetchAndLoadQuiz();
+                // Ruft die Fragen ab
+                await fetchAllQuestions();
+                loadNextQuestion(); // Starte mit der ersten Frage
             } catch (error) {
                 console.error("Firebase Auth Fehler:", error);
-                questionElement.textContent = "Fehler bei der Anmeldung: Bitte Firebase-Regeln prüfen.";
+                questionElement.textContent = "Fehler bei der Anmeldung: Bitte Firebase-Regeln prüfen oder Adblocker deaktivieren.";
                 hideLoader();
             }
         }
 
         /**
-         * Ruft alle Quizfragen von Firebase ab und wählt eine zufällige aus.
+         * Ruft ALLE Quizfragen von Firebase ab und speichert sie global.
+         * Verwendet getDocs, um nur einmal abzurufen (keine dauerhafte Listen-Verbindung).
          */
-        async function fetchAndLoadQuiz() {
-            showLoader();
-            questionElement.textContent = "Frage wird geladen...";
-            
-            // Pfad zur öffentlichen Collection: /artifacts/{appId}/public/data/{collectionName}
+        async function fetchAllQuestions() {
+            showLoader("Datenbank wird verbunden...");
             const collectionPath = `artifacts/${appId}/public/data/quizfragen`; 
 
             try {
-                // Hole alle Dokumente aus der Collection 'quizfragen'
+                // Einmaliger Abruf der Dokumente (Query Snapshot)
                 const querySnapshot = await getDocs(collection(db, collectionPath));
                 
-                const questions = [];
+                allQuestions = [];
                 querySnapshot.forEach((doc) => {
                     const data = doc.data();
-                    // Stelle sicher, dass die notwendigen Felder existieren
                     if (data.frage && data.antworten && typeof data.korrekterIndex === 'number') {
-                        questions.push(data);
+                        allQuestions.push(data);
                     }
                 });
                 
-                if (questions.length === 0) {
+                if (allQuestions.length === 0) {
                     questionElement.textContent = "Keine Fragen in der Datenbank gefunden! Bitte die Collection 'quizfragen' prüfen.";
                     hideLoader();
-                    return;
+                    throw new Error("No questions found.");
                 }
-
-                // Wähle eine zufällige Frage aus
-                const randomIndex = Math.floor(Math.random() * questions.length);
-                currentQuizData = questions[randomIndex];
-
-                // Lade die UI mit der ausgewählten Frage
-                loadQuizUI(currentQuizData);
-                hideLoader();
 
             } catch (e) {
                 console.error("Fehler beim Abrufen der Fragen:", e);
                 questionElement.textContent = `Fehler beim Laden der Fragen: ${e.message}`;
                 hideLoader();
+                throw e; 
             }
+        }
+        
+        /**
+         * Wählt eine zufällige Frage aus und aktualisiert die UI.
+         */
+        function loadNextQuestion() {
+            if (allQuestions.length === 0) {
+                questionElement.textContent = "Keine Fragen verfügbar.";
+                hideNextButton();
+                return;
+            }
+            
+            showLoader("Nächste Frage wird geladen...");
+            
+            // 1. Logik zurücksetzen
+            solutionShown = false;
+            hideNextButton();
+            optionsGrid.innerHTML = ''; // Optionen leeren
+            hintText.textContent = "Drücke die **Leertaste** (Space), um die **Lösung** anzuzeigen!";
+
+            // 2. Zufällige Frage wählen
+            const randomIndex = Math.floor(Math.random() * allQuestions.length);
+            currentQuizData = allQuestions[randomIndex];
+
+            // 3. UI laden
+            loadQuizUI(currentQuizData);
+            hideLoader();
         }
 
         // =================================================================
-        // 3. UI LOGIK
+        // 3. UI LOGIK & EVENTS
         // =================================================================
 
         /**
@@ -262,36 +313,71 @@
                 
                 optionsGrid.appendChild(optionDiv);
             });
+            
+            optionsGrid.classList.remove('hidden');
+        }
+
+        /**
+         * Zeigt die korrekte Lösung an und den "Nächste Frage"-Button.
+         */
+        function showSolution() {
+            if (solutionShown) return;
+            
+            solutionShown = true;
+            
+            const correctOption = document.querySelector('[data-correct="true"]');
+            
+            if (correctOption) {
+                correctOption.classList.add('solution');
+            }
+            
+            hintText.textContent = "Drücke **Enter**, um die nächste Frage zu laden.";
+            showNextButton();
         }
         
-        function showLoader() {
+        function showLoader(text) {
+            questionElement.textContent = text;
             loader.classList.remove('hidden');
             optionsGrid.classList.add('hidden');
+            hideNextButton();
+            hintText.classList.add('hidden');
         }
 
         function hideLoader() {
             loader.classList.add('hidden');
             optionsGrid.classList.remove('hidden');
+            hintText.classList.remove('hidden');
+        }
+
+        function showNextButton() {
+            nextButton.classList.remove('hidden');
+        }
+        
+        function hideNextButton() {
+            nextButton.classList.add('hidden');
         }
 
 
         // Event-Listener für Tastatureingaben
         document.addEventListener('keydown', function(event) {
-            // Überprüfen, ob die Leertaste gedrückt wurde UND eine Frage geladen ist
-            if ((event.key === ' ' || event.keyCode === 32) && currentQuizData) {
-                
+            if (!currentQuizData) return;
+            
+            // 1. Leertaste: Lösung anzeigen
+            if ((event.key === ' ' || event.keyCode === 32)) {
                 event.preventDefault(); // Verhindert Scrollen
-                
-                // Das Element mit dem Attribut data-correct="true" finden
-                const correctOption = document.querySelector('[data-correct="true"]');
-                
-                if (correctOption && !correctOption.classList.contains('solution')) {
-                    // Die CSS-Klasse hinzufügen, um die grüne Umrandung anzuzeigen
-                    correctOption.classList.add('solution');
-                }
+                showSolution();
+            }
+            
+            // 2. Enter-Taste: Nächste Frage laden (wenn Lösung gezeigt wurde)
+            if ((event.key === 'Enter' || event.keyCode === 13) && solutionShown) {
+                 event.preventDefault(); // Verhindert Formular-Aktionen
+                 loadNextQuestion();
             }
         });
 
+        // Event-Listener für Button-Klick
+        nextButton.addEventListener('click', loadNextQuestion);
+        
         // Beim Laden der Seite starten
         window.addEventListener('load', authenticateAndStart);
 
